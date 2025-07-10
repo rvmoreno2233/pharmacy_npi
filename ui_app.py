@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import datetime
+import io
 
 # -------------------------------
 # CONFIG
@@ -9,8 +10,9 @@ import datetime
 ROOT = Path(__file__).resolve().parent
 TODAY = datetime.date.today().isoformat()
 CSV_FILE = ROOT / f"npi_pharmacies_{TODAY}.csv"
+GROUP_CSV = ROOT / "group_pharmacies.csv"
 
-# Define the standard column list (must match ETL output)
+# Define the standard columns
 STANDARD_COLUMNS = [
     'NPI',
     'Provider Organization Name (Legal Business Name)',
@@ -47,12 +49,9 @@ DISPLAY_LABELS = {
 def load_data(path):
     df = pd.read_csv(path, dtype=str)
     df.fillna("", inplace=True)
-
-    # Ensure all standard columns exist
     for col in STANDARD_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-
     return df[STANDARD_COLUMNS]
 
 # -------------------------------
@@ -74,7 +73,6 @@ df = load_data(CSV_FILE)
 with st.sidebar:
     st.header("Filter Pharmacies")
 
-    # Multi-select Taxonomy Code
     taxonomy_options = sorted(df['Healthcare Provider Taxonomy Code_1'].unique())
     selected_taxonomy = st.multiselect(
         "Select Taxonomy Codes",
@@ -82,7 +80,6 @@ with st.sidebar:
         default=taxonomy_options
     )
 
-    # Multi-select States
     state_options = sorted(df['Provider Business Practice Location Address State Name'].unique())
     selected_states = st.multiselect(
         "Select States",
@@ -90,7 +87,6 @@ with st.sidebar:
         default=state_options
     )
 
-    # Free-text search
     search_term = st.text_input(
         "Search by Pharmacy Name or Organization Name",
         placeholder="Type to search..."
@@ -119,7 +115,7 @@ if search_term.strip():
     ]
 
 # -------------------------------
-# Display Results
+# Display Filtered Table
 # -------------------------------
 display_df = filtered_df.rename(columns=DISPLAY_LABELS)
 
@@ -127,15 +123,109 @@ st.subheader(f"Results: {len(display_df)} pharmacies found")
 st.dataframe(display_df, use_container_width=True)
 
 # -------------------------------
-# Download Button
+# Select Pharmacies to Add to Group
 # -------------------------------
-if not display_df.empty:
-    csv_data = display_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Filtered CSV",
-        data=csv_data,
-        file_name=f"filtered_pharmacies_{TODAY}.csv",
-        mime='text/csv'
-    )
-else:
-    st.info("No pharmacies match the selected filters.")
+st.subheader("📌 Step 1: Select Pharmacies for Group")
+
+selected_npis = st.multiselect(
+    "Select pharmacies by NPI:",
+    options=filtered_df['NPI'],
+    format_func=lambda npi: f"{npi} - {filtered_df.loc[filtered_df['NPI'] == npi, 'Provider Other Organization Name_y'].values[0] if not filtered_df.loc[filtered_df['NPI'] == npi, 'Provider Other Organization Name_y'].empty else ''}"
+)
+
+# -------------------------------
+# Group Details
+# -------------------------------
+st.subheader("📌 Step 2: Define Group Details")
+
+group_name = st.text_input("Group Name (e.g. P305 340B Pharmacies)")
+start_date = st.date_input("Start Date")
+end_date = st.date_input("End Date")
+
+# -------------------------------
+# Add to Group Button
+# -------------------------------
+if st.button("✅ Add Selected Pharmacies to Group"):
+    if not selected_npis:
+        st.warning("⚠️ Please select at least one pharmacy.")
+    elif not group_name.strip():
+        st.warning("⚠️ Please enter a group name.")
+    else:
+        # Prepare new records
+        new_entries = []
+        for npi in selected_npis:
+            pharmacy_name = filtered_df.loc[filtered_df['NPI'] == npi, 'Provider Other Organization Name_y'].values[0]
+            new_entries.append({
+                'Group Name': group_name.strip(),
+                'NPI': npi,
+                'Pharmacy Name': pharmacy_name,
+                'Start Date': start_date.isoformat(),
+                'End Date': end_date.isoformat()
+            })
+
+        # Load existing or create new
+        try:
+            existing_df = pd.read_csv(GROUP_CSV, dtype=str)
+        except FileNotFoundError:
+            existing_df = pd.DataFrame(columns=['Group Name', 'NPI', 'Pharmacy Name', 'Start Date', 'End Date'])
+
+        # Append new
+        updated_df = pd.concat([existing_df, pd.DataFrame(new_entries)], ignore_index=True)
+        updated_df.to_csv(GROUP_CSV, index=False)
+
+        st.success(f"✅ Added {len(new_entries)} pharmacies to group '{group_name}'.")
+
+# -------------------------------
+# View Existing Groups
+# -------------------------------
+st.subheader("📋 View Existing Groups")
+
+try:
+    groups_df = pd.read_csv(GROUP_CSV, dtype=str)
+    if not groups_df.empty:
+        st.dataframe(groups_df, use_container_width=True)
+
+        # ⭐️ New Feature: Download CSV
+        csv_data = groups_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Group Assignments CSV",
+            data=csv_data,
+            file_name="group_pharmacies.csv",
+            mime="text/csv"
+        )
+
+        # ⭐️ New Feature: Delete Selected Rows
+        st.markdown("---")
+        st.subheader("🗑️ Delete Entries")
+        delete_npis = st.multiselect(
+            "Select entries by NPI to delete from groups:",
+            options=groups_df['NPI'].unique()
+        )
+        if st.button("❌ Delete Selected"):
+            if delete_npis:
+                groups_df = groups_df[~groups_df['NPI'].isin(delete_npis)]
+                groups_df.to_csv(GROUP_CSV, index=False)
+                st.success(f"Deleted entries for NPIs: {', '.join(delete_npis)}")
+                st.experimental_rerun()
+
+        # ⭐️ New Feature: Edit Start/End Dates
+        st.markdown("---")
+        st.subheader("✏️ Edit Start/End Dates for Group Entries")
+        edit_npis = st.multiselect(
+            "Select NPIs to edit:",
+            options=groups_df['NPI'].unique()
+        )
+        new_start = st.date_input("New Start Date for Selected NPIs")
+        new_end = st.date_input("New End Date for Selected NPIs")
+        if st.button("✏️ Apply Date Changes"):
+            if edit_npis:
+                groups_df.loc[groups_df['NPI'].isin(edit_npis), 'Start Date'] = new_start.isoformat()
+                groups_df.loc[groups_df['NPI'].isin(edit_npis), 'End Date'] = new_end.isoformat()
+                groups_df.to_csv(GROUP_CSV, index=False)
+                st.success(f"Updated dates for NPIs: {', '.join(edit_npis)}")
+                st.experimental_rerun()
+
+    else:
+        st.info("No groups found yet. Add some above!")
+except FileNotFoundError:
+    st.info("No `group_pharmacies.csv` found yet. Add a group to create it!")
